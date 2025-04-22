@@ -17,7 +17,7 @@ const {
 const { randomUUID } = require('crypto');
 require('dotenv').config();
 const { QuickDB } = require('quick.db');
-const express = require('express'); // Added Express import
+const express = require('express');
 
 // Initialize components
 const db = new QuickDB({ filePath: 'database.sqlite' });
@@ -229,8 +229,9 @@ client.on('interactionCreate', async interaction => {
                     .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
             }
 
-            constUUID();
-UUID();
+            // Generate unique request ID
+            const requestId = randomUUID();
+
             const baseEmbed = new EmbedBuilder()
                 .setTitle('Game Update Request')
                 .addFields(
@@ -327,9 +328,7 @@ UUID();
     }
 });
 
-// ====================
 // Keep-Alive Web Server
-// ====================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -341,8 +340,6 @@ app.listen(PORT, () => {
   console.log(`🖥️ Web server running on port ${PORT}`);
 });
 
-// ====================
 // Start Discord Client
-// ====================
 client.on('ready', () => console.log(`🚀 Logged in as ${client.user.tag}`));
 client.login(TOKEN);
