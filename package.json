@@ -1,14 +1,15 @@
 {
-  "name": "discord-game-update-bot",
+  "name": "discord-bot",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.9.1",
-    "discord.js": "^14.18.0",
-    "dotenv": "^16.5.0",
-    "quick.db": "^9.1.7"
+    "discord.js": "^14.13.0",
+    "quick.db": "^9.0.8",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
   }
 }
+
