@@ -15,12 +15,14 @@ const {
     TextInputStyle
 } = require('discord.js');
 const { randomUUID } = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
-const { QuickDB } = require('quick.db');
 const express = require('express');
 
-// Initialize components
-const db = new QuickDB({ filePath: 'database.sqlite' });
+// Initialize Supabase
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+// Initialize Discord Client
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -84,13 +86,37 @@ rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands })
     .then(() => console.log('✅ Commands registered'))
     .catch(console.error);
 
+// Supabase Helper Functions
+async function getGuildSettings(guildId) {
+    const { data, error } = await supabase
+        .from('guild_settings')
+        .select('*')
+        .eq('guild_id', guildId)
+        .single();
+
+    if (error && error.code !== 'PGRST116') throw error; // PGRST116: No rows found
+    return data || { guild_id: guildId, log_channel: null, roles: [], game_update_channel: null, game_update_status_channel: null };
+}
+
+async function updateGuildSettings(guildId, updates) {
+    const { error } = await supabase
+        .from('guild_settings')
+        .upsert({ guild_id: guildId, ...updates }, { onConflict: 'guild_id' });
+
+    if (error) throw error;
+}
+
 // Permission Checker
 const checkPermissions = async (interaction) => {
     const guildId = interaction.guild.id;
-    const allowedRoles = await db.get(`${guildId}.roles`) || [];
+    const settings = await getGuildSettings(guildId);
+    const allowedRoles = settings.roles || [];
     return interaction.member.permissions.has('Administrator') || 
            interaction.member.roles.cache.some(r => allowedRoles.includes(r.id));
 };
+
+// In-memory storage for game update requests (since they are temporary)
+const requests = new Map();
 
 client.on('interactionCreate', async interaction => {
     if (!interaction.inGuild()) return;
@@ -107,70 +133,81 @@ client.on('interactionCreate', async interaction => {
             return true;
         };
 
-        switch(interaction.commandName) {
-            case 'logchannel':
-                if (!await handlePermissionCheck()) return;
-                const logChannel = interaction.options.getChannel('channel');
-                await db.set(`${guildId}.logChannel`, logChannel.id);
-                await interaction.reply({ content: `✅ Log channel set to ${logChannel}`, ephemeral: true })
-                    .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
-                break;
+        try {
+            switch(interaction.commandName) {
+                case 'logchannel':
+                    if (!await handlePermissionCheck()) return;
+                    const logChannel = interaction.options.getChannel('channel');
+                    await updateGuildSettings(guildId, { log_channel: logChannel.id });
+                    await interaction.reply({ content: `✅ Log channel set to ${logChannel}`, ephemeral: true })
+                        .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
+                    break;
 
-            case 'addrole':
-                if (!await handlePermissionCheck()) return;
-                const addRole = interaction.options.getRole('role');
-                await db.push(`${guildId}.roles`, addRole.id);
-                await interaction.reply({ content: `✅ Added ${addRole.name} to management roles`, ephemeral: true })
-                    .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
-                break;
+                case 'addrole':
+                    if (!await handlePermissionCheck()) return;
+                    const addRole = interaction.options.getRole('role');
+                    const settingsAddRole = await getGuildSettings(guildId);
+                    const newRolesAdd = [...new Set([...settingsAddRole.roles, addRole.id])];
+                    await updateGuildSettings(guildId, { roles: newRolesAdd });
+                    await interaction.reply({ content: `✅ Added ${addRole.name} to management roles`, ephemeral: true })
+                        .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
+                    break;
 
-            case 'removerole':
-                if (!await handlePermissionCheck()) return;
-                const removeRole = interaction.options.getRole('role');
-                await db.pull(`${guildId}.roles`, removeRole.id);
-                await interaction.reply({ content: `✅ Removed ${removeRole.name} from management roles`, ephemeral: true })
-                    .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
-                break;
+                case 'removerole':
+                    if (!await handlePermissionCheck()) return;
+                    const removeRole = interaction.options.getRole('role');
+                    const settingsRemoveRole = await getGuildSettings(guildId);
+                    const newRolesRemove = settingsRemoveRole.roles.filter(r => r !== removeRole.id);
+                    await updateGuildSettings(guildId, { roles: newRolesRemove });
+                    await interaction.reply({ content: `✅ Removed ${removeRole.name} from management roles`, ephemeral: true })
+                        .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
+                    break;
 
-            case 'viewrole':
-                const roles = await db.get(`${guildId}.roles`) || [];
-                await interaction.reply({
-                    content: roles.length ? 
-                        `🔑 Management Roles: ${roles.map(r => `<@&${r}>`).join(' ')}` : 
-                        'No management roles configured!',
-                    ephemeral: true
-                }).then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
-                break;
+                case 'viewrole':
+                    const settingsViewRole = await getGuildSettings(guildId);
+                    const roles = settingsViewRole.roles || [];
+                    await interaction.reply({
+                        content: roles.length ? 
+                            `🔑 Management Roles: ${roles.map(r => `<@&${r}>`).join(' ')}` : 
+                            'No management roles configured!',
+                        ephemeral: true
+                    }).then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
+                    break;
 
-            case 'gameupdatechannel':
-                if (!await handlePermissionCheck()) return;
-                const updateChannel = interaction.options.getChannel('channel');
-                await db.set(`${guildId}.gameUpdateChannel`, updateChannel.id);
-                
-                // Create initial system embed
-                const systemEmbed = new EmbedBuilder()
-                    .setTitle('🎮 Game Update System')
-                    .setDescription('Click below to request a game update');
-                
-                const requestButton = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('request_update')
-                        .setLabel('Request Update')
-                        .setStyle(ButtonStyle.Primary)
-                );
-                
-                await updateChannel.send({ embeds: [systemEmbed], components: [requestButton] });
-                await interaction.reply({ content: `✅ Game update system configured in ${updateChannel}`, ephemeral: true })
-                    .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
-                break;
+                case 'gameupdatechannel':
+                    if (!await handlePermissionCheck()) return;
+                    const updateChannel = interaction.options.getChannel('channel');
+                    await updateGuildSettings(guildId, { game_update_channel: updateChannel.id });
+                    
+                    // Create initial system embed
+                    const systemEmbed = new EmbedBuilder()
+                        .setTitle('🎮 Game Update System')
+                        .setDescription('Click below to request a game update');
+                    
+                    const requestButton = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder()
+                            .setCustomId('request_update')
+                            .setLabel('Request Update')
+                            .setStyle(ButtonStyle.Primary)
+                    );
+                    
+                    await updateChannel.send({ embeds: [systemEmbed], components: [requestButton] });
+                    await interaction.reply({ content: `✅ Game update system configured in ${updateChannel}`, ephemeral: true })
+                        .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
+                    break;
 
-            case 'gameupdatestatuschannel':
-                if (!await handlePermissionCheck()) return;
-                const statusChannel = interaction.options.getChannel('channel');
-                await db.set(`${guildId}.gameUpdateStatusChannel`, statusChannel.id);
-                await interaction.reply({ content: `✅ Game update status channel set to ${statusChannel}`, ephemeral: true })
-                    .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
-                break;
+                case 'gameupdatestatuschannel':
+                    if (!await handlePermissionCheck()) return;
+                    const statusChannel = interaction.options.getChannel('channel');
+                    await updateGuildSettings(guildId, { game_update_status_channel: statusChannel.id });
+                    await interaction.reply({ content: `✅ Game update status channel set to ${statusChannel}`, ephemeral: true })
+                        .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
+                    break;
+            }
+        } catch (error) {
+            console.error(`Error handling command ${interaction.commandName}:`, error);
+            await interaction.reply({ content: '❌ An error occurred while processing your command.', ephemeral: true })
+                .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
         }
     }
 
@@ -220,9 +257,10 @@ client.on('interactionCreate', async interaction => {
 
         try {
             const guildId = interaction.guild.id;
-            const logChannelId = await db.get(`${guildId}.logChannel`);
-            const gameUpdateChannelId = await db.get(`${guildId}.gameUpdateChannel`);
-            const gameUpdateStatusChannelId = await db.get(`${guildId}.gameUpdateStatusChannel`);
+            const settings = await getGuildSettings(guildId);
+            const logChannelId = settings.log_channel;
+            const gameUpdateChannelId = settings.game_update_channel;
+            const gameUpdateStatusChannelId = settings.game_update_status_channel;
 
             if (!logChannelId || !gameUpdateChannelId) {
                 return interaction.reply({ content: '❌ System not fully configured!', ephemeral: true })
@@ -263,8 +301,8 @@ client.on('interactionCreate', async interaction => {
             const targetChannel = await client.channels.fetch(targetChannelId);
             const statusMessage = await targetChannel.send({ embeds: [baseEmbed] });
 
-            // Store references
-            await db.set(`requests.${requestId}`, {
+            // Store references in memory (temporary storage for requests)
+            requests.set(requestId, {
                 logMessageId: logMessage.id,
                 statusMessageId: statusMessage.id,
                 logChannelId,
@@ -284,7 +322,7 @@ client.on('interactionCreate', async interaction => {
     // Update Status Button
     if (interaction.isButton() && interaction.customId.startsWith('update_')) {
         const requestId = interaction.customId.split('_')[1];
-        const requestData = await db.get(`requests.${requestId}`);
+        const requestData = requests.get(requestId);
 
         if (!requestData) {
             return interaction.reply({ content: '❌ Request not found', ephemeral: true })
@@ -317,7 +355,7 @@ client.on('interactionCreate', async interaction => {
             await statusMessage.edit({ embeds: [updatedStatusEmbed] });
 
             // Cleanup
-            await db.delete(`requests.${requestId}`);
+            requests.delete(requestId);
             await interaction.reply({ content: '✅ Status updated!', ephemeral: true })
                 .then(msg => setTimeout(() => msg.delete().catch(() => {}), 3000));
         } catch (error) {
@@ -333,11 +371,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-  res.status(200).send('Discord Bot is running!');
+    res.status(200).send('Discord Bot is running!');
 });
 
 app.listen(PORT, () => {
-  console.log(`🖥️ Web server running on port ${PORT}`);
+    console.log(`🖥️ Web server running on port ${PORT}`);
 });
 
 // Start Discord Client
